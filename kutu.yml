@@ -1,0 +1,1041 @@
+name: Kutu APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Proje dosyalarini uret
+        run: |
+          P=app/src/main/java/com/kutu/app
+          mkdir -p $P app/src/main/res/drawable
+
+          cat > settings.gradle.kts << 'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "Kutu"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts << 'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+
+          cat > gradle.properties << 'EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx3g
+          kotlin.code.style=official
+          EOF
+
+          cat > app/build.gradle.kts << 'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.kutu.app"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.kutu.app"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+              <application
+                  android:label="Kutu"
+                  android:icon="@drawable/ic_kutu"
+                  android:theme="@android:style/Theme.Material.NoActionBar"
+                  android:usesCleartextTraffic="true">
+                  <activity android:name=".MainActivity" android:exported="true" android:launchMode="singleTop">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                      <intent-filter>
+                          <action android:name="android.intent.action.SEND" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <data android:mimeType="text/plain" />
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".DownloadService" android:exported="false" android:foregroundServiceType="dataSync" />
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/res/drawable/ic_kutu.xml << 'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp" android:height="108dp"
+              android:viewportWidth="108" android:viewportHeight="108">
+              <path android:fillColor="#0D0D0D" android:pathData="M0,0h108v108h-108z" />
+              <path android:fillColor="#1C1C1C" android:strokeColor="#E53935" android:strokeWidth="2" android:pathData="M28,52h52v36h-52z" />
+              <path android:fillColor="#E53935" android:pathData="M28,70h26v18h-26z" />
+              <path android:fillColor="#E53935" android:pathData="M22,40h64v12h-64z" />
+          </vector>
+          EOF
+
+          cat > app/src/main/res/drawable/ic_stat.xml << 'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp" android:height="24dp"
+              android:viewportWidth="24" android:viewportHeight="24">
+              <path android:fillColor="#FFFFFF" android:pathData="M3,7h18v4h-18z M4,12h16v8h-16z" />
+          </vector>
+          EOF
+
+          cat > $P/Store.kt << 'EOF'
+          package com.kutu.app
+
+          import android.content.Context
+          import android.graphics.Color
+          import android.os.Handler
+          import android.os.Looper
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.io.File
+          import java.net.URLDecoder
+          import java.util.concurrent.CopyOnWriteArrayList
+
+          class Item(val id: String, val url: String) {
+              var name = "dosya"
+              var type = "diger"
+              var total = -1L
+              var status = "queued"
+              var uri = ""
+              var parts = LongArray(4)
+              var ranges = false
+              var probed = false
+              @Volatile var speed = 0L
+              fun done(): Long = parts.sum()
+          }
+
+          object Store {
+              val items = CopyOnWriteArrayList<Item>()
+              var onChange: (() -> Unit)? = null
+              private val main = Handler(Looper.getMainLooper())
+              private var loaded = false
+
+              @Synchronized
+              fun load(c: Context) {
+                  if (loaded) return
+                  loaded = true
+                  try {
+                      val a = JSONArray(c.getSharedPreferences("kutu", 0).getString("items", "[]"))
+                      for (i in 0 until a.length()) {
+                          val o = a.getJSONObject(i)
+                          val m = Item(o.getString("id"), o.getString("url"))
+                          m.name = o.optString("name", "dosya")
+                          m.type = o.optString("type", "diger")
+                          m.total = o.optLong("total", -1L)
+                          m.status = o.optString("status", "paused")
+                          m.uri = o.optString("uri", "")
+                          m.ranges = o.optBoolean("ranges", false)
+                          m.probed = o.optBoolean("probed", false)
+                          val ps = o.optString("parts", "0,0,0,0").split(",")
+                          m.parts = LongArray(4) { k -> ps.getOrNull(k)?.toLongOrNull() ?: 0L }
+                          if (m.status == "running" || m.status == "queued") m.status = "paused"
+                          items.add(m)
+                      }
+                  } catch (e: Exception) {
+                  }
+              }
+
+              @Synchronized
+              fun save(c: Context) {
+                  val a = JSONArray()
+                  for (m in items) {
+                      a.put(
+                          JSONObject().put("id", m.id).put("url", m.url).put("name", m.name)
+                              .put("type", m.type).put("total", m.total).put("status", m.status)
+                              .put("uri", m.uri).put("parts", m.parts.joinToString(","))
+                              .put("ranges", m.ranges).put("probed", m.probed)
+                      )
+                  }
+                  c.getSharedPreferences("kutu", 0).edit().putString("items", a.toString()).apply()
+              }
+
+              fun changed() {
+                  main.post { onChange?.invoke() }
+              }
+
+              fun tmp(c: Context, id: String): File = File(c.getExternalFilesDir(null) ?: c.filesDir, "$id.part")
+
+              fun fmt(b: Long): String = when {
+                  b >= 1073741824L -> String.format("%.2f GB", b / 1073741824.0)
+                  b >= 1048576L -> String.format("%.1f MB", b / 1048576.0)
+                  b >= 1024L -> String.format("%d KB", b / 1024L)
+                  else -> "$b B"
+              }
+
+              fun info(m: Item): String {
+                  val p = if (m.total > 0) (m.done() * 100 / m.total).toInt() else 0
+                  return when (m.status) {
+                      "running" -> "%" + p + " · " + fmt(m.done()) + (if (m.total > 0) " / " + fmt(m.total) else "") + " · " + fmt(m.speed) + "/s"
+                      "queued" -> "Sıraya alındı…"
+                      "paused" -> "Duraklatıldı · %" + p
+                      "error" -> "Hata · ▶ ile tekrar dene"
+                      "done" -> "Tamam · " + fmt(m.total)
+                      else -> ""
+                  }
+              }
+
+              fun typeOf(name: String, ct: String?): String {
+                  val e = name.substringAfterLast('.', "").lowercase()
+                  val c = ct?.lowercase() ?: ""
+                  return when {
+                      e in setOf("mp4", "mkv", "webm", "avi", "mov", "3gp", "flv", "wmv", "m4v", "ts", "mpeg") -> "video"
+                      e in setOf("png", "jpg", "jpeg", "webp", "gif", "bmp", "heic", "avif") -> "foto"
+                      e in setOf("mp3", "m4a", "flac", "wav", "ogg", "aac", "opus", "wma") -> "muzik"
+                      c.startsWith("video/") -> "video"
+                      c.startsWith("image/") -> "foto"
+                      c.startsWith("audio/") -> "muzik"
+                      else -> "diger"
+                  }
+              }
+
+              fun typeColor(t: String): Int = when (t) {
+                  "video" -> Color.parseColor("#E53935")
+                  "foto" -> Color.parseColor("#1E88E5")
+                  "muzik" -> Color.parseColor("#8E24AA")
+                  else -> Color.parseColor("#FB8C00")
+              }
+
+              fun nameFromUrl(u: String): String {
+                  val path = u.substringBefore('?').substringBefore('#').trimEnd('/')
+                  var n = path.substringAfterLast('/')
+                  try {
+                      n = URLDecoder.decode(n, "UTF-8")
+                  } catch (e: Exception) {
+                  }
+                  n = n.replace(Regex("[\\\\/:*?\"<>|]"), "_")
+                  return n.ifBlank { "dosya" }
+              }
+          }
+          EOF
+
+          cat > $P/BoxView.kt << 'EOF'
+          package com.kutu.app
+
+          import android.animation.ValueAnimator
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.RectF
+          import android.view.View
+          import android.view.animation.BounceInterpolator
+
+          object BoxArt {
+              fun draw(c: Canvas, w: Float, p: Float, lid: Float, fill: Int, lidCol: Int) {
+                  val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+                  val gap = w * 0.03f
+                  val bx = w * 0.08f
+                  val by = w * 0.42f
+                  val bw = w * 0.84f
+                  val bh = w * 0.52f
+                  val cw = (bw - gap) / 2f
+                  val ch = (bh - gap) / 2f
+                  val rad = w * 0.03f
+                  for (i in 0 until 4) {
+                      val l = bx + (i % 2) * (cw + gap)
+                      val t = by + (i / 2) * (ch + gap)
+                      val r = RectF(l, t, l + cw, t + ch)
+                      paint.style = Paint.Style.FILL
+                      paint.color = Color.parseColor("#1C1C1C")
+                      c.drawRoundRect(r, rad, rad, paint)
+                      val q = ((p - i * 0.25f) / 0.25f).coerceIn(0f, 1f)
+                      if (q > 0f) {
+                          c.save()
+                          c.clipRect(l, t + ch * (1f - q), l + cw, t + ch)
+                          paint.color = fill
+                          c.drawRoundRect(r, rad, rad, paint)
+                          c.restore()
+                      }
+                      paint.style = Paint.Style.STROKE
+                      paint.strokeWidth = w * 0.012f
+                      paint.color = fill
+                      paint.alpha = 150
+                      c.drawRoundRect(r, rad, rad, paint)
+                  }
+                  c.save()
+                  c.rotate(-16f * (1f - lid), w * 0.04f, by)
+                  paint.style = Paint.Style.FILL
+                  paint.color = lidCol
+                  c.drawRoundRect(RectF(w * 0.04f, w * 0.30f, w * 0.96f, by), rad, rad, paint)
+                  c.restore()
+              }
+
+              fun bitmap(p: Float, lid: Float, fill: Int, lidCol: Int, size: Int = 192): Bitmap {
+                  val b = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+                  draw(Canvas(b), size.toFloat(), p, lid, fill, lidCol)
+                  return b
+              }
+          }
+
+          class BoxView(ctx: Context) : View(ctx) {
+              private var shownP = 0f
+              private var lid = 0f
+              private var tp = 0f
+              private var tl = 0f
+              private var col = Color.RED
+              private var inited = false
+              private var pa: ValueAnimator? = null
+              private var la: ValueAnimator? = null
+
+              fun show(p: Float, done: Boolean, color: Int) {
+                  col = color
+                  val l = if (done) 1f else 0f
+                  if (!inited) {
+                      inited = true
+                      shownP = p; tp = p; lid = l; tl = l
+                      invalidate()
+                      return
+                  }
+                  if (p != tp) {
+                      tp = p
+                      pa?.cancel()
+                      pa = ValueAnimator.ofFloat(shownP, p).apply {
+                          duration = 450
+                          addUpdateListener { shownP = it.animatedValue as Float; invalidate() }
+                          start()
+                      }
+                  }
+                  if (l != tl) {
+                      tl = l
+                      la?.cancel()
+                      la = ValueAnimator.ofFloat(lid, l).apply {
+                          duration = 900
+                          interpolator = BounceInterpolator()
+                          addUpdateListener { lid = it.animatedValue as Float; invalidate() }
+                          start()
+                      }
+                      if (done) {
+                          animate().scaleX(1.18f).scaleY(1.18f).setDuration(160).withEndAction {
+                              animate().scaleX(1f).scaleY(1f).setDuration(220).start()
+                          }.start()
+                      }
+                  }
+                  invalidate()
+              }
+
+              override fun onDraw(c: Canvas) {
+                  val s = minOf(width, height).toFloat()
+                  BoxArt.draw(c, s, shownP, lid, col, col)
+              }
+          }
+          EOF
+
+          cat > $P/Downloader.kt << 'EOF'
+          package com.kutu.app
+
+          import android.content.ContentValues
+          import android.content.Context
+          import android.net.Uri
+          import android.provider.MediaStore
+          import android.webkit.MimeTypeMap
+          import java.io.File
+          import java.io.IOException
+          import java.io.RandomAccessFile
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.net.URLDecoder
+          import java.util.concurrent.CopyOnWriteArraySet
+
+          class Downloader(private val ctx: Context, private val item: Item, private val onTick: () -> Unit) {
+              @Volatile private var stop = false
+              @Volatile private var failed: Exception? = null
+              private val conns = CopyOnWriteArraySet<HttpURLConnection>()
+              private var lastTick = 0L
+              private var lastSave = 0L
+              private var lastBytes = 0L
+              private val ua = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36"
+
+              fun pause() {
+                  stop = true
+                  for (c in conns) {
+                      try {
+                          c.disconnect()
+                      } catch (e: Exception) {
+                      }
+                  }
+              }
+
+              fun run() {
+                  try {
+                      if (!item.probed) probe()
+                      val tmp = Store.tmp(ctx, item.id)
+                      val usable = item.ranges && item.total > 0
+                      if (usable) {
+                          if (!tmp.exists()) item.parts = LongArray(4)
+                          RandomAccessFile(tmp, "rw").use { it.setLength(item.total) }
+                          val ps = (item.total + 3) / 4
+                          val ts = (0 until 4).map { i ->
+                              Thread { part(i, tmp, i * ps, minOf(item.total - 1, i * ps + ps - 1)) }.also { it.start() }
+                          }
+                          ts.forEach { it.join() }
+                      } else {
+                          single(tmp)
+                      }
+                      val f = failed
+                      if (f != null) throw f
+                      if (stop) {
+                          item.status = "paused"
+                          return
+                      }
+                      if (item.total <= 0) item.total = item.done()
+                      if (item.done() < item.total) throw IOException("eksik")
+                      publish(tmp)
+                      item.status = "done"
+                  } catch (e: Exception) {
+                      item.status = if (failed == null && stop) "paused" else "error"
+                  }
+              }
+
+              private fun open(url: String, from: Long, to: Long): HttpURLConnection {
+                  var u = url
+                  for (n in 0 until 8) {
+                      val c = URL(u).openConnection() as HttpURLConnection
+                      c.connectTimeout = 15000
+                      c.readTimeout = 20000
+                      c.instanceFollowRedirects = false
+                      c.setRequestProperty("User-Agent", ua)
+                      c.setRequestProperty("Accept", "*/*")
+                      c.setRequestProperty("Accept-Encoding", "identity")
+                      if (from >= 0) c.setRequestProperty("Range", "bytes=" + from + "-" + (if (to >= 0) to.toString() else ""))
+                      val code = c.responseCode
+                      if (code in 301..303 || code == 307 || code == 308) {
+                          val loc = c.getHeaderField("Location") ?: throw IOException("yonlendirme")
+                          u = URL(URL(u), loc).toString()
+                          c.disconnect()
+                          continue
+                      }
+                      conns.add(c)
+                      return c
+                  }
+                  throw IOException("cok fazla yonlendirme")
+              }
+
+              private fun probe() {
+                  val c = open(item.url, 0, 0)
+                  try {
+                      val code = c.responseCode
+                      val ct = c.contentType
+                      var total = -1L
+                      if (code == 206) {
+                          item.ranges = true
+                          total = c.getHeaderField("Content-Range")?.substringAfter('/')?.trim()?.toLongOrNull() ?: -1L
+                      } else if (code == 200) {
+                          item.ranges = false
+                          total = c.contentLengthLong
+                      } else {
+                          throw IOException("HTTP " + code)
+                      }
+                      item.total = total
+                      val cd = c.getHeaderField("Content-Disposition") ?: ""
+                      var nm = Regex("filename\\*?=(?:UTF-8'')?\"?([^\";]+)\"?", RegexOption.IGNORE_CASE)
+                          .find(cd)?.groupValues?.get(1)
+                      if (nm != null) {
+                          try {
+                              nm = URLDecoder.decode(nm, "UTF-8")
+                          } catch (e: Exception) {
+                          }
+                      }
+                      if (nm.isNullOrBlank()) nm = Store.nameFromUrl(c.url.toString())
+                      if (!nm.contains('.')) {
+                          val ext = MimeTypeMap.getSingleton().getExtensionFromMimeType(ct?.substringBefore(';')?.trim())
+                          if (ext != null) nm = nm + "." + ext
+                      }
+                      item.name = nm
+                      item.type = Store.typeOf(nm, ct)
+                      item.probed = true
+                  } finally {
+                      conns.remove(c)
+                      c.disconnect()
+                  }
+              }
+
+              private fun part(i: Int, tmp: File, start: Long, end: Long) {
+                  var fails = 0
+                  while (!stop && start + item.parts[i] <= end) {
+                      try {
+                          val pos = start + item.parts[i]
+                          val c = open(item.url, pos, end)
+                          try {
+                              if (c.responseCode != 206) throw IOException("HTTP " + c.responseCode)
+                              RandomAccessFile(tmp, "rw").use { raf ->
+                                  raf.seek(pos)
+                                  val ins = c.inputStream
+                                  val buf = ByteArray(65536)
+                                  while (!stop) {
+                                      val n = ins.read(buf)
+                                      if (n < 0) break
+                                      raf.write(buf, 0, n)
+                                      item.parts[i] += n.toLong()
+                                      tick()
+                                  }
+                              }
+                          } finally {
+                              conns.remove(c)
+                              c.disconnect()
+                          }
+                          if (!stop && start + item.parts[i] <= end) throw IOException("erken bitti")
+                          fails = 0
+                      } catch (e: Exception) {
+                          if (stop) return
+                          fails++
+                          if (fails > 90) {
+                              failed = e
+                              pause()
+                              return
+                          }
+                          try {
+                              Thread.sleep(minOf(fails * 1500L, 10000L))
+                          } catch (ie: InterruptedException) {
+                          }
+                      }
+                  }
+              }
+
+              private fun single(tmp: File) {
+                  var fails = 0
+                  while (!stop) {
+                      try {
+                          item.parts = LongArray(4)
+                          tmp.delete()
+                          val c = open(item.url, -1, -1)
+                          var complete = false
+                          try {
+                              if (c.responseCode != 200) throw IOException("HTTP " + c.responseCode)
+                              tmp.outputStream().use { out ->
+                                  val ins = c.inputStream
+                                  val buf = ByteArray(65536)
+                                  while (!stop) {
+                                      val n = ins.read(buf)
+                                      if (n < 0) {
+                                          complete = true
+                                          break
+                                      }
+                                      out.write(buf, 0, n)
+                                      item.parts[0] += n.toLong()
+                                      tick()
+                                  }
+                              }
+                          } finally {
+                              conns.remove(c)
+                              c.disconnect()
+                          }
+                          if (complete) return
+                      } catch (e: Exception) {
+                          if (stop) return
+                          fails++
+                          if (fails > 5) {
+                              failed = e
+                              return
+                          }
+                          try {
+                              Thread.sleep(3000)
+                          } catch (ie: InterruptedException) {
+                          }
+                      }
+                  }
+              }
+
+              @Synchronized
+              private fun tick() {
+                  val now = System.currentTimeMillis()
+                  if (now - lastTick < 500) return
+                  val d = item.done()
+                  item.speed = if (lastTick > 0) (d - lastBytes) * 1000 / (now - lastTick) else 0L
+                  lastBytes = d
+                  lastTick = now
+                  if (now - lastSave > 3000) {
+                      lastSave = now
+                      Store.save(ctx)
+                  }
+                  onTick()
+              }
+
+              private fun insert(coll: Uri, rel: String, mime: String): Uri {
+                  val v = ContentValues()
+                  v.put(MediaStore.MediaColumns.DISPLAY_NAME, item.name)
+                  v.put(MediaStore.MediaColumns.RELATIVE_PATH, rel)
+                  v.put(MediaStore.MediaColumns.MIME_TYPE, mime)
+                  v.put(MediaStore.MediaColumns.IS_PENDING, 1)
+                  return ctx.contentResolver.insert(coll, v) ?: throw IOException("kayit acilamadi")
+              }
+
+              private fun publish(tmp: File) {
+                  val ext = item.name.substringAfterLast('.', "").lowercase()
+                  val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "application/octet-stream"
+                  val vol = MediaStore.VOLUME_EXTERNAL_PRIMARY
+                  val uri = try {
+                      when (item.type) {
+                          "video" -> insert(MediaStore.Video.Media.getContentUri(vol), "Movies/Kutu", mime)
+                          "foto" -> insert(MediaStore.Images.Media.getContentUri(vol), "Pictures/Kutu", mime)
+                          "muzik" -> insert(MediaStore.Audio.Media.getContentUri(vol), "Music/Kutu", mime)
+                          else -> insert(MediaStore.Downloads.getContentUri(vol), "Download/Kutu", mime)
+                      }
+                  } catch (e: Exception) {
+                      insert(MediaStore.Downloads.getContentUri(vol), "Download/Kutu", mime)
+                  }
+                  ctx.contentResolver.openOutputStream(uri)!!.use { o ->
+                      tmp.inputStream().use { it.copyTo(o, 65536) }
+                  }
+                  val v = ContentValues()
+                  v.put(MediaStore.MediaColumns.IS_PENDING, 0)
+                  ctx.contentResolver.update(uri, v, null, null)
+                  tmp.delete()
+                  item.uri = uri.toString()
+              }
+          }
+          EOF
+
+          cat > $P/DownloadService.kt << 'EOF'
+          package com.kutu.app
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.Color
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import androidx.core.app.NotificationCompat
+          import java.util.concurrent.ConcurrentHashMap
+
+          class DownloadService : Service() {
+              private val jobs = ConcurrentHashMap<String, Downloader>()
+              private val main = Handler(Looper.getMainLooper())
+              private lateinit var nm: NotificationManager
+              private val red = Color.parseColor("#E53935")
+
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  Store.load(this)
+                  nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("fg", "Kutu çalışıyor", NotificationManager.IMPORTANCE_MIN))
+                  nm.createNotificationChannel(NotificationChannel("dl", "İndirmeler", NotificationManager.IMPORTANCE_LOW))
+              }
+
+              override fun onStartCommand(i: Intent?, flags: Int, startId: Int): Int {
+                  startForeground(1, fgNotif(), ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+                  val id = i?.getStringExtra("id")
+                  val item = Store.items.firstOrNull { it.id == id }
+                  when (i?.action) {
+                      "add", "resume" -> if (item != null && !jobs.containsKey(item.id)) start(item)
+                      "pause" -> id?.let { jobs[it]?.pause() }
+                  }
+                  idle()
+                  return START_NOT_STICKY
+              }
+
+              private fun start(item: Item) {
+                  item.status = "running"
+                  val d = Downloader(this, item) { tick(item) }
+                  jobs[item.id] = d
+                  tick(item)
+                  Thread {
+                      d.run()
+                      main.post {
+                          jobs.remove(item.id)
+                          Store.save(this)
+                          tick(item)
+                          idle()
+                      }
+                  }.start()
+              }
+
+              private fun idle() {
+                  if (jobs.isEmpty()) {
+                      stopForeground(STOP_FOREGROUND_REMOVE)
+                      stopSelf()
+                  } else {
+                      nm.notify(1, fgNotif())
+                  }
+              }
+
+              private fun tick(item: Item) {
+                  val nid = item.id.hashCode() + 2
+                  if (!Store.items.contains(item)) {
+                      nm.cancel(nid)
+                      return
+                  }
+                  nm.notify(nid, notif(item))
+                  Store.changed()
+              }
+
+              private fun fgNotif(): Notification =
+                  NotificationCompat.Builder(this, "fg")
+                      .setSmallIcon(R.drawable.ic_stat)
+                      .setContentTitle("Kutu")
+                      .setContentText(jobs.size.toString() + " indirme sürüyor")
+                      .setOngoing(true)
+                      .build()
+
+              private fun act(a: String, item: Item): PendingIntent =
+                  PendingIntent.getForegroundService(
+                      this, item.id.hashCode() * 31 + a.hashCode(),
+                      Intent(this, DownloadService::class.java).setAction(a).putExtra("id", item.id),
+                      PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                  )
+
+              private fun notif(item: Item): Notification {
+                  val done = item.status == "done"
+                  val p = if (done) 1f else if (item.total > 0) (item.done().toFloat() / item.total).coerceIn(0f, 1f) else 0f
+                  val b = NotificationCompat.Builder(this, "dl")
+                      .setSmallIcon(R.drawable.ic_stat)
+                      .setContentTitle(item.name)
+                      .setContentText(Store.info(item))
+                      .setLargeIcon(BoxArt.bitmap(p, if (done) 1f else 0f, red, red))
+                      .setOnlyAlertOnce(true)
+                      .setOngoing(item.status == "running")
+                      .setAutoCancel(done)
+                      .setContentIntent(
+                          PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+                      )
+                  if (item.status == "running") b.addAction(0, "Duraklat", act("pause", item))
+                  if (item.status == "paused" || item.status == "error") b.addAction(0, "Devam", act("resume", item))
+                  return b.build()
+              }
+          }
+          EOF
+
+          cat > $P/MainActivity.kt << 'EOF'
+          package com.kutu.app
+
+          import android.Manifest
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.app.NotificationManager
+          import android.content.ClipboardManager
+          import android.content.Intent
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.text.InputType
+          import android.text.TextUtils
+          import android.view.Gravity
+          import android.view.View
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.core.content.ContextCompat
+          import java.util.UUID
+
+          class MainActivity : Activity() {
+              private val red = Color.parseColor("#E53935")
+              private val urlRe = Regex("^https?://\\S+$")
+              private lateinit var list: LinearLayout
+              private lateinit var input: EditText
+              private var tab = "hepsi"
+              private val rows = HashMap<String, Row>()
+              private val tabViews = LinkedHashMap<String, TextView>()
+
+              class Row(val root: LinearLayout, val box: BoxView, val name: TextView, val info: TextView, val act: TextView)
+
+              private fun dp(x: Int) = (x * resources.displayMetrics.density).toInt()
+
+              private fun tv(t: String, size: Float, color: Int = Color.WHITE, bold: Boolean = false): TextView {
+                  val v = TextView(this)
+                  v.text = t
+                  v.textSize = size
+                  v.setTextColor(color)
+                  if (bold) v.setTypeface(v.typeface, Typeface.BOLD)
+                  return v
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  Store.load(this)
+                  window.statusBarColor = Color.parseColor("#0D0D0D")
+                  window.navigationBarColor = Color.parseColor("#0D0D0D")
+                  if (Build.VERSION.SDK_INT >= 33) requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setBackgroundColor(Color.parseColor("#0D0D0D"))
+                  root.setPadding(dp(16), dp(8), dp(16), dp(8))
+                  root.fitsSystemWindows = true
+
+                  val head = LinearLayout(this)
+                  head.gravity = Gravity.CENTER_VERTICAL
+                  val logo = BoxView(this)
+                  logo.show(0f, false, red)
+                  logo.postDelayed({ logo.show(1f, true, red) }, 500)
+                  head.addView(logo, LinearLayout.LayoutParams(dp(44), dp(44)))
+                  head.addView(tv("  KUTU", 26f, red, true))
+
+                  val inRow = LinearLayout(this)
+                  inRow.gravity = Gravity.CENTER_VERTICAL
+                  input = EditText(this)
+                  input.hint = "Linki yapıştır…"
+                  input.setHintTextColor(Color.GRAY)
+                  input.setTextColor(Color.WHITE)
+                  input.setSingleLine()
+                  input.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+                  val go = Button(this)
+                  go.text = "İndir"
+                  go.setTextColor(Color.WHITE)
+                  go.setBackgroundColor(red)
+                  go.setOnClickListener {
+                      addUrl(input.text.toString().trim())
+                      input.setText("")
+                  }
+                  inRow.addView(input, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                  inRow.addView(go)
+
+                  val tabs = LinearLayout(this)
+                  val names = listOf("hepsi" to "Hepsi", "video" to "Video", "foto" to "Foto", "muzik" to "Müzik", "diger" to "Diğer")
+                  for ((k, label) in names) {
+                      val t = tv(label, 14f, Color.GRAY, true)
+                      t.gravity = Gravity.CENTER
+                      t.setPadding(0, dp(10), 0, dp(10))
+                      t.setOnClickListener {
+                          tab = k
+                          styleTabs()
+                          list.removeAllViews()
+                          rows.clear()
+                          sync()
+                      }
+                      tabViews[k] = t
+                      tabs.addView(t, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                  }
+                  styleTabs()
+
+                  list = LinearLayout(this)
+                  list.orientation = LinearLayout.VERTICAL
+                  val sv = ScrollView(this)
+                  sv.addView(list)
+
+                  root.addView(head)
+                  root.addView(inRow)
+                  root.addView(tabs)
+                  root.addView(sv, LinearLayout.LayoutParams(-1, 0, 1f))
+                  setContentView(root)
+                  if (savedInstanceState == null) handle(intent)
+              }
+
+              private fun styleTabs() {
+                  for ((k, v) in tabViews) {
+                      v.setTextColor(if (k == tab) red else Color.GRAY)
+                      v.setBackgroundColor(if (k == tab) Color.parseColor("#1C1C1C") else Color.TRANSPARENT)
+                  }
+              }
+
+              private fun makeRow(id: String): Row {
+                  val root = LinearLayout(this)
+                  root.gravity = Gravity.CENTER_VERTICAL
+                  root.setPadding(dp(8), dp(8), dp(8), dp(8))
+                  root.setBackgroundColor(Color.parseColor("#151515"))
+                  val box = BoxView(this)
+                  val col = LinearLayout(this)
+                  col.orientation = LinearLayout.VERTICAL
+                  val name = tv("", 15f, Color.WHITE, true)
+                  name.maxLines = 1
+                  name.ellipsize = TextUtils.TruncateAt.MIDDLE
+                  val info = tv("", 12f, Color.GRAY)
+                  col.addView(name)
+                  col.addView(info)
+                  val act = tv("", 22f)
+                  act.setPadding(dp(12), dp(4), dp(12), dp(4))
+                  act.setOnClickListener { toggle(id) }
+                  val del = tv("✕", 18f, Color.GRAY)
+                  del.setPadding(dp(12), dp(4), dp(8), dp(4))
+                  del.setOnClickListener { remove(id) }
+                  root.addView(box, LinearLayout.LayoutParams(dp(64), dp(64)))
+                  val clp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                  clp.leftMargin = dp(10)
+                  root.addView(col, clp)
+                  root.addView(act)
+                  root.addView(del)
+                  root.setOnClickListener { openFile(id) }
+                  val lp = LinearLayout.LayoutParams(-1, -2)
+                  lp.topMargin = dp(8)
+                  root.layoutParams = lp
+                  return Row(root, box, name, info, act)
+              }
+
+              private fun sync() {
+                  val shown = Store.items.filter { tab == "hepsi" || it.type == tab }
+                  val ids = shown.map { it.id }.toSet()
+                  for (id in rows.keys.toList()) {
+                      if (id !in ids) {
+                          list.removeView(rows[id]!!.root)
+                          rows.remove(id)
+                      }
+                  }
+                  for (m in shown.reversed()) {
+                      var r = rows[m.id]
+                      if (r == null) {
+                          r = makeRow(m.id)
+                          rows[m.id] = r
+                          list.addView(r.root, 0)
+                      }
+                      val done = m.status == "done"
+                      val p = if (done) 1f else if (m.total > 0) (m.done().toFloat() / m.total).coerceIn(0f, 1f) else 0f
+                      r.box.show(p, done, if (done) Store.typeColor(m.type) else red)
+                      r.name.text = m.name
+                      r.info.text = Store.info(m)
+                      r.act.text = if (m.status == "running" || m.status == "queued") "⏸" else if (done) "" else "▶"
+                      r.act.visibility = if (done) View.GONE else View.VISIBLE
+                  }
+              }
+
+              private fun svc(action: String, id: String) {
+                  ContextCompat.startForegroundService(
+                      this, Intent(this, DownloadService::class.java).setAction(action).putExtra("id", id)
+                  )
+              }
+
+              private fun toggle(id: String) {
+                  val m = Store.items.firstOrNull { it.id == id } ?: return
+                  svc(if (m.status == "running" || m.status == "queued") "pause" else "resume", id)
+              }
+
+              private fun remove(id: String) {
+                  val m = Store.items.firstOrNull { it.id == id } ?: return
+                  if (m.status == "running") svc("pause", id)
+                  Store.items.remove(m)
+                  Store.tmp(this, id).delete()
+                  getSystemService(NotificationManager::class.java).cancel(id.hashCode() + 2)
+                  Store.save(this)
+                  sync()
+              }
+
+              private fun openFile(id: String) {
+                  val m = Store.items.firstOrNull { it.id == id } ?: return
+                  if (m.status != "done" || m.uri.isEmpty()) return
+                  try {
+                      val u = Uri.parse(m.uri)
+                      startActivity(
+                          Intent(Intent.ACTION_VIEW).setDataAndType(u, contentResolver.getType(u) ?: "*/*")
+                              .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                      )
+                  } catch (e: Exception) {
+                      Toast.makeText(this, "Açılamadı", Toast.LENGTH_SHORT).show()
+                  }
+              }
+
+              private fun addUrl(u: String) {
+                  if (!urlRe.matches(u)) {
+                      Toast.makeText(this, "Geçerli bir link değil", Toast.LENGTH_SHORT).show()
+                      return
+                  }
+                  val m = Item(UUID.randomUUID().toString(), u)
+                  m.name = Store.nameFromUrl(u)
+                  m.type = Store.typeOf(m.name, null)
+                  Store.items.add(0, m)
+                  Store.save(this)
+                  sync()
+                  svc("add", m.id)
+              }
+
+              private fun handle(i: Intent?) {
+                  if (i == null || i.action != Intent.ACTION_SEND) return
+                  val t = i.getStringExtra(Intent.EXTRA_TEXT) ?: return
+                  val m = Regex("https?://\\S+").find(t)?.value ?: return
+                  addUrl(m)
+              }
+
+              override fun onNewIntent(i: Intent?) {
+                  super.onNewIntent(i)
+                  handle(i)
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  Store.onChange = { sync() }
+                  sync()
+              }
+
+              override fun onPause() {
+                  super.onPause()
+                  Store.onChange = null
+              }
+
+              override fun onWindowFocusChanged(hasFocus: Boolean) {
+                  super.onWindowFocusChanged(hasFocus)
+                  if (!hasFocus) return
+                  val cm = getSystemService(ClipboardManager::class.java)
+                  val clip = cm.primaryClip ?: return
+                  if (clip.itemCount == 0) return
+                  val t = clip.getItemAt(0).coerceToText(this).toString().trim()
+                  val p = getSharedPreferences("kutu", 0)
+                  if (t == p.getString("lastclip", "") || !urlRe.matches(t)) return
+                  p.edit().putString("lastclip", t).apply()
+                  AlertDialog.Builder(this)
+                      .setTitle("Link bulundu")
+                      .setMessage(t + "\n\nİndireyim mi?")
+                      .setPositiveButton("İndir") { _, _ -> addUrl(t) }
+                      .setNegativeButton("Hayır", null)
+                      .show()
+              }
+          }
+          EOF
+
+      - name: APK derle
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: APK yukle
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kutu-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Release olustur
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Kutu build ${{ github.run_number }}
+          files: app/build/outputs/apk/debug/app-debug.apk
